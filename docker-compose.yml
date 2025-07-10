@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  blacklist-harvester:
+    build: .
+    container_name: blacklist-harvester
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - NODE_ENV=production
+      - ETHEREUM_RPC_URL=${ETHEREUM_RPC_URL}
+      - TRON_GRID_API_KEY=${TRON_GRID_API_KEY}
+      - TRON_FULL_NODE=${TRON_FULL_NODE:-https://api.trongrid.io}
+      - DATABASE_PATH=/app/data/blacklist.db
+      - PORT=3000
+      - CHUNK_SIZE=${CHUNK_SIZE:-10000}
+      - SYNC_INTERVAL_MINUTES=${SYNC_INTERVAL_MINUTES:-10}
+    restart: unless-stopped
+    networks:
+      - blacklist-network
+
+  # Optional: Add a database viewer
+  adminer:
+    image: adminer
+    container_name: blacklist-db-viewer
+    ports:
+      - "8080:8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=sqlite
+    volumes:
+      - ./data:/data
+    networks:
+      - blacklist-network
+    profiles:
+      - debug
+
+networks:
+  blacklist-network:
+    driver: bridge 
