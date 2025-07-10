@@ -16,16 +16,19 @@ class TronSync {
     this.chunkSize = parseInt(process.env.CHUNK_SIZE || '200'); // Smaller chunks for TRON
   }
 
-  async processEvent(event, token) {
+  async processEvent(event, token, eventConfig) {
     // Extract address from event result
     const address = event.result._user || event.result[0];
     
     // Convert TRON address to hex format for consistency
     const hexAddress = this.tronWeb.address.toHex(address);
     
-    // Determine if this is a blacklist or unblacklist event
+    // Determine if this is a blacklist or unblacklist event based on event name
     let isBlacklisted = true;
-    if (event.event_name === 'RemovedBlackList') {
+    const eventName = event.event_name;
+    
+    // Check if this is an unblacklist event
+    if (eventName === 'RemovedBlackList' || eventName === 'UnBlacklisted') {
       isBlacklisted = false;
     }
 
@@ -46,6 +49,7 @@ class TronSync {
     
     try {
       while (true) {
+        logger.info(`Fetching TRON events for ${eventName} from ${new Date(minBlockTimestamp).toISOString()} to ${new Date(maxBlockTimestamp).toISOString()}`);
         const url = `${this.tronWeb.fullNode.host}/v1/contracts/${contractAddress}/events`;
         const params = new URLSearchParams({
           event_name: eventName,
@@ -84,15 +88,17 @@ class TronSync {
         fingerprint = data.meta.fingerprint;
       }
     } catch (error) {
-      logger.error(`Error fetching TRON events: ${error.message}`);
+      logger.error(`Error fetching TRON events for ${eventName}: ${error.message}`);
       throw error;
     }
 
     return events;
   }
 
-  async syncToken(tokenSymbol, contractAddress) {
+  async syncToken(tokenSymbol, contractConfig) {
     try {
+      const { address: contractAddress, events: eventConfigs } = contractConfig;
+      
       const lastSyncedBlock = await database.getLastSyncedBlock('TRON', tokenSymbol);
       
       // Get current block info
@@ -112,15 +118,15 @@ class TronSync {
         }
       }
 
-      logger.info(`Starting ${tokenSymbol} TRON sync from timestamp ${fromTimestamp} to ${currentTimestamp}`);
+      logger.info(`Starting ${tokenSymbol} TRON sync from timestamp ${new Date(fromTimestamp).toISOString()} to ${new Date(currentTimestamp).toISOString()}`);
 
-      // Fetch both AddedBlackList and RemovedBlackList events
-      const [addedEvents, removedEvents] = await Promise.all([
-        this.getContractEvents(contractAddress, 'AddedBlackList', fromTimestamp, currentTimestamp),
-        this.getContractEvents(contractAddress, 'RemovedBlackList', fromTimestamp, currentTimestamp)
-      ]);
+      // Fetch events for all configured event types
+      const allEventPromises = eventConfigs.map(eventConfig => 
+        this.getContractEvents(contractAddress, eventConfig.eventName, fromTimestamp, currentTimestamp)
+      );
 
-      const allEvents = [...addedEvents, ...removedEvents];
+      const allEventResults = await Promise.all(allEventPromises);
+      const allEvents = allEventResults.flat();
       
       if (allEvents.length > 0) {
         logger.info(`Found ${allEvents.length} events for ${tokenSymbol} on TRON`);
@@ -130,7 +136,7 @@ class TronSync {
         
         const entries = [];
         for (const event of allEvents) {
-          const entry = await this.processEvent(event, tokenSymbol);
+          const entry = await this.processEvent(event, tokenSymbol, eventConfigs);
           entries.push(entry);
         }
         
@@ -148,14 +154,27 @@ class TronSync {
   }
 
   async syncUSDT() {
+    if (!CONTRACTS.TRON.USDT) {
+      logger.warn('USDT contract not configured for TRON');
+      return;
+    }
     await this.syncToken('USDT', CONTRACTS.TRON.USDT);
+  }
+
+  async syncUSDC() {
+    if (!CONTRACTS.TRON.USDC) {
+      logger.warn('USDC contract not configured for TRON');
+      return;
+    }
+    await this.syncToken('USDC', CONTRACTS.TRON.USDC);
   }
 
   async syncAll() {
     logger.info('Starting TRON sync...');
     
-    // Currently only USDT on TRON
+    // Sync all available tokens
     await this.syncUSDT();
+    await this.syncUSDC();
     
     logger.info('TRON sync completed');
   }
@@ -173,17 +192,32 @@ class TronSync {
         const currentTimestamp = currentBlock.block_header.raw_data.timestamp;
         const fromTimestamp = currentTimestamp - (pollInterval * 2); // Look back 2x poll interval
 
-        const [addedEvents, removedEvents] = await Promise.all([
-          this.getContractEvents(CONTRACTS.TRON.USDT, 'AddedBlackList', fromTimestamp, currentTimestamp),
-          this.getContractEvents(CONTRACTS.TRON.USDT, 'RemovedBlackList', fromTimestamp, currentTimestamp)
-        ]);
-
-        const allEvents = [...addedEvents, ...removedEvents];
+        // Poll for events from all configured tokens
+        const tokenPromises = [];
         
-        for (const event of allEvents) {
-          logger.info('New TRON event:', event);
-          const entry = await this.processEvent(event, 'USDT');
-          await database.upsertBlacklistEntry(entry);
+        if (CONTRACTS.TRON.USDT) {
+          const usdtPromises = CONTRACTS.TRON.USDT.events.map(eventConfig =>
+            this.getContractEvents(CONTRACTS.TRON.USDT.address, eventConfig.eventName, fromTimestamp, currentTimestamp)
+          );
+          tokenPromises.push(...usdtPromises.map(p => p.then(events => ({ token: 'USDT', events }))));
+        }
+
+        if (CONTRACTS.TRON.USDC) {
+          const usdcPromises = CONTRACTS.TRON.USDC.events.map(eventConfig =>
+            this.getContractEvents(CONTRACTS.TRON.USDC.address, eventConfig.eventName, fromTimestamp, currentTimestamp)
+          );
+          tokenPromises.push(...usdcPromises.map(p => p.then(events => ({ token: 'USDC', events }))));
+        }
+
+        const results = await Promise.all(tokenPromises);
+        
+        for (const result of results) {
+          for (const event of result.events) {
+            logger.info(`New TRON ${result.token} event:`, event);
+            const tokenConfig = CONTRACTS.TRON[result.token];
+            const entry = await this.processEvent(event, result.token, tokenConfig.events);
+            await database.upsertBlacklistEntry(entry);
+          }
         }
       } catch (error) {
         logger.error('TRON live sync error:', error);
