@@ -54,6 +54,7 @@ class Database {
         transaction_hash = excluded.transaction_hash,
         timestamp = excluded.timestamp,
         last_updated = excluded.last_updated
+      WHERE excluded.timestamp > timestamp
     `, [
       address.toLowerCase(),
       token,
@@ -80,6 +81,7 @@ class Database {
         transaction_hash = excluded.transaction_hash,
         timestamp = excluded.timestamp,
         last_updated = excluded.last_updated
+      WHERE excluded.timestamp > timestamp
     `);
 
     const now = Date.now();
