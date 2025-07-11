@@ -45,6 +45,39 @@ class TronSync {
 
   async getContractEvents(contractAddress, eventName, minBlockTimestamp, maxBlockTimestamp) {
     const events = [];
+    
+    // Check if date range is over 1 month (30 days)
+    const oneMonthMs = 30 * 24 * 60 * 60 * 1000;
+    const dateRange = maxBlockTimestamp - minBlockTimestamp;
+    
+    if (dateRange > oneMonthMs) {
+      // Split into monthly chunks
+      logger.info(`Date range is ${Math.ceil(dateRange / oneMonthMs)} months, splitting into monthly batches`);
+      
+      let currentStart = minBlockTimestamp;
+      while (currentStart < maxBlockTimestamp) {
+        const currentEnd = Math.min(currentStart + oneMonthMs, maxBlockTimestamp);
+        
+        logger.info(`Fetching batch: ${new Date(currentStart).toISOString()} to ${new Date(currentEnd).toISOString()}`);
+        const batchEvents = await this.fetchEventsForRange(contractAddress, eventName, currentStart, currentEnd);
+        events.push(...batchEvents);
+        
+        currentStart = currentEnd + 1; // Move to next batch
+        
+        // Add a small delay between batches to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    } else {
+      // Single request for smaller date ranges
+      const rangeEvents = await this.fetchEventsForRange(contractAddress, eventName, minBlockTimestamp, maxBlockTimestamp);
+      events.push(...rangeEvents);
+    }
+
+    return events;
+  }
+
+  async fetchEventsForRange(contractAddress, eventName, minBlockTimestamp, maxBlockTimestamp) {
+    const events = [];
     let fingerprint = '';
     
     try {
@@ -110,7 +143,8 @@ class TronSync {
       const currentTimestamp = currentBlock.block_header.raw_data.timestamp;
 
       // If we have a last synced block and not forcing full sync, get its timestamp
-      let fromTimestamp = 0;
+      // let fromTimestamp = 1483804800000; // the first txn on TRON: January 8, 2017
+      let fromTimestamp = new Date().getTime() - (365 * 24 * 60 * 60 * 1000); // Set a range to fetch latest 1 year
       if (lastSyncedBlock > 0 && !forceFullSync) {
         try {
           const lastBlock = await this.tronWeb.trx.getBlockByNumber(lastSyncedBlock);
