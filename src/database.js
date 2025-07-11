@@ -177,6 +177,16 @@ class Database {
     return { stats, syncStatus };
   }
 
+  async clearBlacklistData(network, token) {
+    const result = await this.db.run(
+      'DELETE FROM blacklist WHERE network = ? AND token = ?',
+      [network, token]
+    );
+    
+    console.log(`Cleared ${result.changes} blacklist entries for ${token} on ${network}`);
+    return result.changes;
+  }
+
   async close() {
     if (this.db) {
       await this.db.close();

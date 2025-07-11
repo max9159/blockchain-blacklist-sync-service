@@ -55,7 +55,7 @@ class TronSync {
           event_name: eventName,
           min_block_timestamp: minBlockTimestamp,
           max_block_timestamp: maxBlockTimestamp,
-          limit: 200
+          limit: 100
         });
         
         if (fingerprint) {
@@ -95,20 +95,23 @@ class TronSync {
     return events;
   }
 
-  async syncToken(tokenSymbol, contractConfig) {
+  async syncToken(tokenSymbol, contractConfig, forceFullSync = false) {
     try {
       const { address: contractAddress, events: eventConfigs } = contractConfig;
       
-      const lastSyncedBlock = await database.getLastSyncedBlock('TRON', tokenSymbol);
+      let lastSyncedBlock = 0;
+      if (!forceFullSync) {
+        lastSyncedBlock = await database.getLastSyncedBlock('TRON', tokenSymbol);
+      }
       
       // Get current block info
       const currentBlock = await this.tronWeb.trx.getCurrentBlock();
       const currentBlockNumber = currentBlock.block_header.raw_data.number;
       const currentTimestamp = currentBlock.block_header.raw_data.timestamp;
 
-      // If we have a last synced block, get its timestamp
+      // If we have a last synced block and not forcing full sync, get its timestamp
       let fromTimestamp = 0;
-      if (lastSyncedBlock > 0) {
+      if (lastSyncedBlock > 0 && !forceFullSync) {
         try {
           const lastBlock = await this.tronWeb.trx.getBlockByNumber(lastSyncedBlock);
           fromTimestamp = lastBlock.block_header.raw_data.timestamp + 1;
@@ -118,7 +121,8 @@ class TronSync {
         }
       }
 
-      logger.info(`Starting ${tokenSymbol} TRON sync from timestamp ${new Date(fromTimestamp).toISOString()} to ${new Date(currentTimestamp).toISOString()}`);
+      const syncType = forceFullSync ? 'FULL' : (lastSyncedBlock > 0 ? 'INCREMENTAL' : 'INITIAL');
+      logger.info(`Starting ${tokenSymbol} TRON ${syncType} sync from timestamp ${new Date(fromTimestamp).toISOString()} to ${new Date(currentTimestamp).toISOString()}`);
 
       // Fetch events for all configured event types
       const allEventPromises = eventConfigs.map(eventConfig => 
@@ -140,8 +144,16 @@ class TronSync {
           entries.push(entry);
         }
         
+        if (forceFullSync) {
+          // For full sync, we might want to clear existing data first
+          logger.info(`Clearing existing ${tokenSymbol} TRON data before full sync`);
+          await database.clearBlacklistData('TRON', tokenSymbol);
+        }
+        
         await database.batchUpsertBlacklistEntries(entries);
         logger.info(`Processed ${entries.length} ${tokenSymbol} TRON blacklist entries`);
+      } else {
+        logger.info(`No new events found for ${tokenSymbol} on TRON`);
       }
 
       await database.updateSyncStatus('TRON', tokenSymbol, currentBlockNumber);
@@ -153,28 +165,28 @@ class TronSync {
     }
   }
 
-  async syncUSDT() {
+  async syncUSDT(forceFullSync = false) {
     if (!CONTRACTS.TRON.USDT) {
       logger.warn('USDT contract not configured for TRON');
       return;
     }
-    await this.syncToken('USDT', CONTRACTS.TRON.USDT);
+    await this.syncToken('USDT', CONTRACTS.TRON.USDT, forceFullSync);
   }
 
-  async syncUSDC() {
+  async syncUSDC(forceFullSync = false) {
     if (!CONTRACTS.TRON.USDC) {
       logger.warn('USDC contract not configured for TRON');
       return;
     }
-    await this.syncToken('USDC', CONTRACTS.TRON.USDC);
+    await this.syncToken('USDC', CONTRACTS.TRON.USDC, forceFullSync);
   }
 
-  async syncAll() {
-    logger.info('Starting TRON sync...');
+  async syncAll(forceFullSync = false) {
+    logger.info(`Starting TRON ${forceFullSync ? 'FULL ' : ''}sync...`);
     
     // Sync all available tokens
-    await this.syncUSDT();
-    await this.syncUSDC();
+    await this.syncUSDT(forceFullSync);
+    await this.syncUSDC(forceFullSync);
     
     logger.info('TRON sync completed');
   }
@@ -237,16 +249,25 @@ if (isMainModule) {
   
   await database.init(process.env.DATABASE_PATH || './data/blacklist.db');
   
+  // Check for command line arguments
+  const args = process.argv.slice(2);
+  const isOnceMode = args.includes('--once');
+  const isFullSync = args.includes('--full-sync');
+  
+  if (isFullSync) {
+    logger.info('Full sync mode enabled - will re-fetch all historical data');
+  }
+  
   // Run initial sync
-  await sync.syncAll();
+  await sync.syncAll(isFullSync);
   
   // Start live sync if not in one-time mode
-  if (process.argv[2] !== '--once') {
+  if (!isOnceMode) {
     await sync.liveSync();
     
     // Also run periodic full sync to catch any missed events
     setInterval(async () => {
-      await sync.syncAll();
+      await sync.syncAll(false); // Don't force full sync on periodic runs
     }, parseInt(process.env.SYNC_INTERVAL_MINUTES || '10') * 60 * 1000);
   }
 }
