@@ -8,6 +8,8 @@
     "start:api": "node src/api/server.js",
     "start:ethereum": "node src/ethereum/sync.js",
     "start:tron": "node src/tron/sync.js",
+    "fullsync:ethereum": "node src/ethereum/sync.js --full-sync",
+    "fullsync:tron": "node src/tron/sync.js --full-sync",
     "start:all": "node src/index.js all --once",
     "test": "node --test",
     "test:connection": "node scripts/test-connection.js",

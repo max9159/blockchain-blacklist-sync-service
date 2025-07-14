@@ -60,169 +60,147 @@ class EthereumSync {
     };
   }
 
-  async syncToken(tokenSymbol, contractAddress, events, startBlock) {
+  async syncToken(tokenSymbol, contractAddress, events, startBlock, forceFullSync = false) {
     try {
       const lastSyncedBlock = await database.getLastSyncedBlock('ETHEREUM', tokenSymbol);
-      const fromBlock = safeMax(lastSyncedBlock + 1, startBlock);
+      let fromBlock = safeMax(lastSyncedBlock + 1, startBlock);
+      if (forceFullSync) {
+        fromBlock = startBlock;
+        logger.info(`Clearing existing ${tokenSymbol} ETHEREUM data before full sync`);
+        await database.clearBlacklistData('ETHEREUM', tokenSymbol);
+      }
       const latestBlockBigInt = await this.web3.eth.getBlockNumber();
       const latestBlock = safeToNumber(latestBlockBigInt);
 
       logger.info(`Starting ${tokenSymbol} sync from block ${fromBlock} to ${latestBlock}`);
 
-      let currentBlock = fromBlock;
-      
-      while (currentBlock <= latestBlock) {
-        const toBlock = safeMin(currentBlock + this.chunkSize - 1, latestBlock);
-        
-        logger.info(`Fetching ${tokenSymbol} logs from block ${currentBlock} to ${toBlock}`);
-        
-        try {
-          // Query each event type separately to avoid Web3.js v4 validation issues
-          const allLogs = [];
+      const maxBatchSize = 172800; // a 24-day period (assuming an average block time of ~12 seconds, which yields about 7,200 blocks per day: 7,200 × 24 = 172,800)
+      let batchStart = fromBlock;
+      while (batchStart <= latestBlock) {
+        const batchEnd = safeMin(batchStart + maxBatchSize - 1, latestBlock);
+        logger.info(`Processing batch from ${batchStart} to ${batchEnd} for ${tokenSymbol}`);
+        let currentBlock = batchStart;
+        while (currentBlock <= batchEnd) {
+          const toBlock = safeMin(currentBlock + this.chunkSize - 1, batchEnd);
           
-          for (const eventHash of events) {
+          logger.info(`Fetching ${tokenSymbol} logs from block ${currentBlock} to ${toBlock}`);
+          
+          try {
             const logs = await this.web3.eth.getPastLogs({
               fromBlock: currentBlock,
               toBlock: toBlock,
               address: contractAddress,
-              topics: [eventHash]
+              topics: [events]
             });
-            allLogs.push(...logs);
-          }
 
-          if (allLogs.length > 0) {
-            logger.info(`Found ${allLogs.length} events for ${tokenSymbol}`);
-            
-            const entries = [];
-            for (const log of allLogs) {
-              const entry = await this.processLog(log, tokenSymbol);
-              entries.push(entry);
+            if (logs.length > 0) {
+              logger.info(`Found ${logs.length} events for ${tokenSymbol}`);
+              
+              const entries = [];
+              for (const log of logs) {
+                const entry = await this.processLog(log, tokenSymbol);
+                entries.push(entry);
+              }
+              
+              await database.batchUpsertBlacklistEntries(entries);
+              logger.info(`Processed ${entries.length} ${tokenSymbol} blacklist entries`);
             }
-            
-            await database.batchUpsertBlacklistEntries(entries);
-            logger.info(`Processed ${entries.length} ${tokenSymbol} blacklist entries`);
-          }
 
-          await database.updateSyncStatus('ETHEREUM', tokenSymbol, toBlock);
-          currentBlock = toBlock + 1;
-          
-          // Add a small delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 100));
-          
-        } catch (error) {
-          if (error.message.includes('query returned more than') || 
-              error.message.includes('range is too large') ||
-              error.message.includes('max is 1k blocks')) {
-            // Reduce chunk size if we hit the log limit
-            this.chunkSize = Math.floor(this.chunkSize / 2);
-            logger.warn(`Reducing chunk size to ${this.chunkSize} due to RPC limit: ${error.message}`);
+            await database.updateSyncStatus('ETHEREUM', tokenSymbol, toBlock);
+            currentBlock = toBlock + 1;
             
-            // Ensure chunk size doesn't go below 100
-            if (this.chunkSize < 100) {
-              this.chunkSize = 100;
-              logger.warn(`Chunk size hit minimum of ${this.chunkSize}`);
+            // Add a small delay to avoid rate limiting
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+          } catch (error) {
+            if (error.message.includes('query returned more than') || 
+                error.message.includes('range is too large') ||
+                error.message.includes('max is 1k blocks')) {
+              // Reduce chunk size if we hit the log limit
+              this.chunkSize = Math.floor(this.chunkSize / 2);
+              logger.warn(`Reducing chunk size to ${this.chunkSize} due to RPC limit: ${error.message}`);
+              
+              // Ensure chunk size doesn't go below 100
+              if (this.chunkSize < 100) {
+                this.chunkSize = 100;
+                logger.warn(`Chunk size hit minimum of ${this.chunkSize}`);
+              }
+              continue;
             }
-            continue;
+            throw error;
           }
-          throw error;
         }
+        batchStart = batchEnd + 1;
       }
 
       logger.info(`${tokenSymbol} sync completed. Last block: ${latestBlock}`);
-      
+          
     } catch (error) {
       logger.error(`Error syncing ${tokenSymbol}:`, error);
       throw error;
     }
   }
 
-  async syncUSDT() {
+  async syncUSDT(forceFullSync = false) {
     await this.syncToken(
       'USDT',
       CONTRACTS.ETHEREUM.USDT,
       [EVENTS.ADDED_BLACKLIST, EVENTS.REMOVED_BLACKLIST],
-      USDT_DEPLOYMENT_BLOCK
+      USDT_DEPLOYMENT_BLOCK,
+      forceFullSync
     );
   }
 
-  async syncUSDC() {
+  async syncUSDC(forceFullSync = false) {
     await this.syncToken(
       'USDC',
       CONTRACTS.ETHEREUM.USDC,
       [EVENTS.BLACKLISTED, EVENTS.UNBLACKLISTED],
-      USDC_DEPLOYMENT_BLOCK
+      USDC_DEPLOYMENT_BLOCK,
+      forceFullSync
     );
   }
 
-  async syncAll() {
+  async syncAll(forceFullSync = false) {
     logger.info('Starting Ethereum sync...');
-    
+      
     // Sync in parallel for better performance
     await Promise.all([
-      this.syncUSDT(),
-      this.syncUSDC()
+      this.syncUSDT(forceFullSync),
+      this.syncUSDC(forceFullSync)
     ]);
-    
+      
     logger.info('Ethereum sync completed');
   }
 
   async liveSync() {
     logger.info('Starting Ethereum live sync...');
-    
+      
     // Set up event subscriptions for real-time updates
     const usdtContract = new this.web3.eth.Contract([], CONTRACTS.ETHEREUM.USDT);
+    usdtContract.events.allEvents({
+      topics: [[EVENTS.ADDED_BLACKLIST, EVENTS.REMOVED_BLACKLIST]]
+    })
+    .on('data', async (event) => {
+      logger.info('New USDT blacklist event:', event);
+      const entry = await this.processLog(event, 'USDT');
+      await database.upsertBlacklistEntry(entry);
+    })
+    .on('error', (error) => {
+      logger.error('USDT blacklist event error:', error);
+    });
+
     const usdcContract = new this.web3.eth.Contract([], CONTRACTS.ETHEREUM.USDC);
-
-    // USDT AddedBlackList events
-    usdtContract.events.allEvents({
-      topics: [EVENTS.ADDED_BLACKLIST]
-    })
-    .on('data', async (event) => {
-      logger.info('New USDT AddedBlackList event:', event);
-      const entry = await this.processLog(event, 'USDT');
-      await database.upsertBlacklistEntry(entry);
-    })
-    .on('error', (error) => {
-      logger.error('USDT AddedBlackList event error:', error);
-    });
-
-    // USDT RemovedBlackList events
-    usdtContract.events.allEvents({
-      topics: [EVENTS.REMOVED_BLACKLIST]
-    })
-    .on('data', async (event) => {
-      logger.info('New USDT RemovedBlackList event:', event);
-      const entry = await this.processLog(event, 'USDT');
-      await database.upsertBlacklistEntry(entry);
-    })
-    .on('error', (error) => {
-      logger.error('USDT RemovedBlackList event error:', error);
-    });
-
-    // USDC Blacklisted events
     usdcContract.events.allEvents({
-      topics: [EVENTS.BLACKLISTED]
+      topics: [[EVENTS.BLACKLISTED, EVENTS.UNBLACKLISTED]]
     })
     .on('data', async (event) => {
-      logger.info('New USDC Blacklisted event:', event);
+      logger.info('New USDC blacklist event:', event);
       const entry = await this.processLog(event, 'USDC');
       await database.upsertBlacklistEntry(entry);
     })
     .on('error', (error) => {
-      logger.error('USDC Blacklisted event error:', error);
-    });
-
-    // USDC UnBlacklisted events
-    usdcContract.events.allEvents({
-      topics: [EVENTS.UNBLACKLISTED]
-    })
-    .on('data', async (event) => {
-      logger.info('New USDC UnBlacklisted event:', event);
-      const entry = await this.processLog(event, 'USDC');
-      await database.upsertBlacklistEntry(entry);
-    })
-    .on('error', (error) => {
-      logger.error('USDC UnBlacklisted event error:', error);
+      logger.error('USDC blacklist event error:', error);
     });
   }
 }
@@ -235,16 +213,24 @@ if (isMainModule) {
   
   await database.init(process.env.DATABASE_PATH || './data/blacklist.db');
   
+  const args = process.argv.slice(2);
+  const isOnceMode = args.includes('--once');
+  const isFullSync = args.includes('--full-sync');
+  
+  if (isFullSync) {
+    logger.info('Full sync mode enabled - will re-fetch all historical data');
+  }
+  
   // Run initial sync
-  await sync.syncAll();
+  await sync.syncAll(isFullSync);
   
   // Start live sync if not in one-time mode
-  if (process.argv[2] !== '--once') {
+  if (!isOnceMode) {
     await sync.liveSync();
     
     // Also run periodic sync to catch any missed events
     setInterval(async () => {
-      await sync.syncAll();
+      await sync.syncAll(false);
     }, parseInt(process.env.SYNC_INTERVAL_MINUTES || '10') * 60 * 1000);
   }
 }
